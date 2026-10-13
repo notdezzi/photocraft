@@ -605,11 +605,13 @@ const BALANCE_LEVELS: f32 = 0.39;
 /// - Preserve Luminosity off: a slider only moves its own channel. Midtones is gamma 2^−a.
 ///   Shadows is gamma 2^(−a/2) after a black point at 0.39·|a| when lowered; highlights is
 ///   gamma 2^(−a/2) after a white point at 1 − 0.39·a when raised.
-/// - Preserve Luminosity on: midtones is gamma 2^(−a/2) on the slider's channel and 2^(a/2) on
-///   the other two. Shadows and highlights go by the differences between a tone's three sliders:
-///   each channel gets a plain black point at 0.39·(max − its own) for shadows and a plain white
-///   point at 1 − 0.39·(its own − min) for highlights (so one raised shadows slider darkens the
-///   other two channels, and two raised together darken only the third).
+/// - Preserve Luminosity on: every tone goes by the differences between its three sliders.
+///   Midtones is gamma 2^((max + min)/2 − its own) per channel (with one slider moved, max + min
+///   is that slider, so this is the single-slider gamma 2^(−a/2) on its channel and 2^(a/2) on
+///   the other two). Shadows and highlights: each channel gets a plain black point at 0.39·(max −
+///   its own) for shadows and a plain white point at 1 − 0.39·(its own − min) for highlights (so
+///   one raised shadows slider darkens the other two channels, and two raised together darken
+///   only the third).
 ///
 /// Tones apply highlights, shadows, then midtones (measured with two and three tones on one
 /// channel: within 1 level).
@@ -620,10 +622,20 @@ pub fn color_balance_channel(tones: [[f32; 3]; 3], preserve_luminosity: bool, ch
     let mut v = v.clamp(0.0, 1.0);
     for (tone, sliders) in [(2, highlights), (0, shadows), (1, midtones)] {
         let a: [f32; 3] = sliders.map(|s| (s / 100.0).clamp(-1.0, 1.0));
-        if preserve_luminosity && tone != 1 {
+        if preserve_luminosity {
             let own = a.get(ch).copied().unwrap_or(0.0);
             let (lo, hi) = a.iter().fold((f32::MAX, f32::MIN), |m, x| (m.0.min(*x), m.1.max(*x)));
-            v = if tone == 0 { black(v, BALANCE_LEVELS * (hi - own)) } else { white(v, 1.0 - BALANCE_LEVELS * (own - lo)) };
+            v = match tone {
+                // #4941: the midtones exponent is the same max/min rule as shadows and highlights
+                // below, not a sum over sliders (that over-shifted with two or three sliders
+                // moved). The `e == 0.0` guard keeps an all-zero tone an exact identity.
+                1 => {
+                    let e = (hi + lo) / 2.0 - own;
+                    if e == 0.0 { v } else { v.powf(2f32.powf(e)) }
+                }
+                0 => black(v, BALANCE_LEVELS * (hi - own)),
+                _ => white(v, 1.0 - BALANCE_LEVELS * (own - lo)),
+            };
             continue;
         }
         for (src, slider) in sliders.iter().enumerate() {
@@ -634,7 +646,6 @@ pub fn color_balance_channel(tones: [[f32; 3]; 3], preserve_luminosity: bool, ch
             }
             v = match (tone, preserve_luminosity) {
                 (1, false) => v.powf(2f32.powf(-a)),
-                (1, true) => v.powf(2f32.powf(if own { -a } else { a } / 2.0)),
                 (0, false) if a < 0.0 => black(v, BALANCE_LEVELS * -a).powf(2f32.powf(-a / 2.0)),
                 (0, false) => v.powf(2f32.powf(-a / 2.0)),
 
@@ -1252,6 +1263,103 @@ mod tone_tests {
                 assert!((g - i32::from(green[i])).abs() <= 1, "{tone} {amount} pl {preserve} at {x}: green {g} vs Photoshop {}", green[i]);
             }
         }
+    }
+
+    /// The midtones rule before #4941: every slider contributed its own ±a/2 gamma term, so the
+    /// Preserve Luminosity exponent for a channel was sum(a)/2 − its own. Kept as the oracle for
+    /// the two tests below.
+    fn color_balance_channel_before_4941(tones: [[f32; 3]; 3], preserve_luminosity: bool, ch: usize, v: f32) -> f32 {
+        let [shadows, midtones, highlights] = tones;
+        let black = |v: f32, b: f32| ((v - b) / (1.0 - b)).max(0.0);
+        let white = |v: f32, w: f32| (v / w).min(1.0);
+        let mut v = v.clamp(0.0, 1.0);
+        for (tone, sliders) in [(2, highlights), (0, shadows), (1, midtones)] {
+            let a: [f32; 3] = sliders.map(|s| (s / 100.0).clamp(-1.0, 1.0));
+            if preserve_luminosity && tone != 1 {
+                let own = a.get(ch).copied().unwrap_or(0.0);
+                let (lo, hi) = a.iter().fold((f32::MAX, f32::MIN), |m, x| (m.0.min(*x), m.1.max(*x)));
+                v = if tone == 0 { black(v, BALANCE_LEVELS * (hi - own)) } else { white(v, 1.0 - BALANCE_LEVELS * (own - lo)) };
+                continue;
+            }
+            for (src, slider) in sliders.iter().enumerate() {
+                let a = (slider / 100.0).clamp(-1.0, 1.0);
+                let own = src == ch;
+                if a == 0.0 || (!preserve_luminosity && !own) {
+                    continue;
+                }
+                v = match (tone, preserve_luminosity) {
+                    (1, false) => v.powf(2f32.powf(-a)),
+                    (1, true) => v.powf(2f32.powf(if own { -a } else { a } / 2.0)),
+                    (0, false) if a < 0.0 => black(v, BALANCE_LEVELS * -a).powf(2f32.powf(-a / 2.0)),
+                    (0, false) => v.powf(2f32.powf(-a / 2.0)),
+
+                    (2, false) if a > 0.0 => white(v, 1.0 - BALANCE_LEVELS * a).powf(2f32.powf(-a / 2.0)),
+                    (2, false) => v.powf(2f32.powf(-a / 2.0)),
+
+                    _ => v,
+                };
+            }
+        }
+        v
+    }
+
+    /// #4941: with Preserve Luminosity on and two or three midtone sliders moved, the old
+    /// sum-over-sliders rule shifted every channel too far — the mean lightness of a gray ramp
+    /// moved by up to 7 levels (e.g. −4.9 for cyan/red +30 with yellow/blue +30). The max/min
+    /// rule keeps it within 3 levels of the input (127.5 for this ramp).
+    #[test]
+    fn color_balance_preserve_luminosity_keeps_mean_lightness_for_several_midtone_sliders() {
+        let ramp_mean = |midtones: [f32; 3]| {
+            let tones = [[0.0; 3], midtones, [0.0; 3]];
+            let mut sum = 0.0;
+            for x in 0..=255u16 {
+                let v = f32::from(x) / 255.0;
+                sum += (0..3).map(|ch| color_balance_channel(tones, true, ch, v)).sum::<f32>() / 3.0;
+            }
+            sum / 256.0 * 255.0
+        };
+        for midtones in [[30.0, 0.0, 30.0], [-30.0, 0.0, -30.0], [30.0, 30.0, 0.0], [30.0, -30.0, 0.0], [30.0, 30.0, 30.0], [-30.0, -30.0, -30.0]] {
+            let mean = ramp_mean(midtones);
+            assert!((mean - 127.5).abs() <= 3.0, "midtones {midtones:?}: mean lightness {mean:.1}, expected near 127.5");
+        }
+    }
+
+    /// One midtone slider moved is bit-identical to before #4941 (with one slider nonzero,
+    /// max + min is that slider, so the max/min rule collapses to the old sum), and so are the
+    /// whole Preserve Luminosity off path and the shadows/highlights branches with any sliders.
+    #[test]
+    fn color_balance_single_slider_and_shadows_and_highlights_are_bit_identical_to_before_4941() {
+        let compare = |tones: [[f32; 3]; 3], preserve: bool| {
+            for ch in 0..3 {
+                for i in 0..=1000u16 {
+                    let v = f32::from(i) / 1000.0;
+                    assert_eq!(
+                        color_balance_channel(tones, preserve, ch, v).to_bits(),
+                        color_balance_channel_before_4941(tones, preserve, ch, v).to_bits(),
+                        "tones {tones:?} preserve {preserve} ch {ch} v {v}"
+                    );
+                }
+            }
+        };
+        for amount in [-100.0f32, -75.0, -30.0, -1.0, 0.0, 1.0, 30.0, 75.0, 100.0] {
+            for tone in 0..3 {
+                for slot in 0..3 {
+                    let mut tones = [[0.0f32; 3]; 3];
+                    tones[tone][slot] = amount;
+                    for preserve in [false, true] {
+                        compare(tones, preserve);
+                    }
+                }
+            }
+        }
+        // Two or three sliders in the shadows and highlights tones, which already went by max/min.
+        for shadows in [[50.0, 0.0, 50.0], [-50.0, 20.0, 0.0], [100.0, -100.0, 50.0], [-30.0, -30.0, -30.0]] {
+            for highlights in [[-50.0, 50.0, 0.0], [30.0, -10.0, 80.0], [0.0; 3]] {
+                compare([shadows, [0.0; 3], highlights], true);
+            }
+        }
+        // Preserve Luminosity off never touches the other channels, however many sliders move.
+        compare([[0.0; 3], [40.0, 0.0, -40.0], [0.0; 3]], false);
     }
 
     #[test]
